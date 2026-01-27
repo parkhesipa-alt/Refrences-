@@ -24,3 +24,11 @@ class VendorRateLimiter:
 
 # GLOBAL limiter (per pod)
 vendor_limiter = VendorRateLimiter(max_requests=99, window_seconds=60)
+
+
+
+
+# 🚦 Vendor rate limit
+    vendor_limiter.acquire()
+
+    unique_id = generate_unique_id(
