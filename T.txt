@@ -1,1 +1,161 @@
-The CRS/FATCA Python-based automation provides end-to-end exception handling and regulatory reporting for India submissions. It resolves approximately 385K manual exceptions across nearly 300K customers by automating occupation classification, data enrichment, validation, and transformation aligned to country-specific schema requirements. The solution improves reporting accuracy, reduces manual effort and human error, saves 2,100–2,600 hours annually (equivalent to ~10 FTE effort), minimizes regulatory and reputational risk, helps avoid penalties arising from defective reporting, and ensures accurate and reliable submissions to the Income Tax Reporting portal.
+from fastapi import FastAPI
+from controllers.pan_name_match_controller import router as pan_router
+
+app = FastAPI(title="PAN Name Match API")
+
+# Health without prefix
+@app.get("/health")
+def health():
+    return {"status": "UP"}
+
+# Business APIs
+app.include_router(pan_router, prefix="/v1")
+
+
+
+
+from pydantic import BaseModel, Field
+
+PAN_REGEX = r"^[A-Z]{5}[0-9]{4}[A-Z]$"
+
+class PanNameMatchRequest(BaseModel):
+    pan: str = Field(
+        ...,
+        min_length=10,
+        max_length=10,
+        pattern=PAN_REGEX,
+        description="PAN number"
+    )
+    name: str = Field(..., description="Name to match")
+
+
+
+from aiolimiter import AsyncLimiter
+
+vendor_limiter = AsyncLimiter(99, 60)
+
+
+
+
+
+from fuzzywuzzy import fuzz
+import logging
+
+MATCH_THRESHOLD = 80
+
+def fuzzy_name_match(api_name: str, input_name: str) -> bool:
+    if not api_name or not input_name:
+        return False
+
+    api_name = api_name.lower().strip()
+    input_name = input_name.lower().strip()
+
+    similarity = fuzz.ratio(api_name, input_name)
+    logging.info(f"API Name: {api_name}")
+    logging.info(f"Input Name: {input_name}")
+    logging.info(f"Similarity Score: {similarity}")
+
+    return similarity > MATCH_THRESHOLD
+
+
+
+
+
+
+import requests
+from fastapi.concurrency import run_in_threadpool
+from utils.rate_limiter import vendor_limiter
+
+KARZA_URL = "https://"
+KARZA_KEY = "YOUR_KARZA_API_KEY"   # load from secret manager in prod
+
+
+def fetch_pan_details_sync(pan: str, consent: str, case_id: str, lite: str):
+    payload = {
+        "pan": pan,
+        "consent": consent,
+        "lite": lite,
+        "clientData": {"caseId": case_id}
+    }
+
+    headers = {
+        "Content-Type": "application/json",
+        "x-karza-key": KARZA_KEY
+    }
+
+    response = requests.post(
+        KARZA_URL,
+        json=payload,
+        headers=headers,
+        timeout=10,
+        verify=False
+    )
+
+    response.raise_for_status()
+    return response.json()
+
+
+async def fetch_pan_details(pan: str, consent: str, case_id: str, lite: str):
+    async with vendor_limiter:
+        return await run_in_threadpool(
+            fetch_pan_details_sync,
+            pan,
+            consent,
+            case_id,
+            lite
+        )
+
+
+
+
+
+
+import uuid
+from fastapi import APIRouter, HTTPException
+
+from models.models_pan_name_match import PanNameMatchRequest
+from services.pan_service import fetch_pan_details
+from utils.name_matcher import fuzzy_name_match
+
+router = APIRouter()
+
+
+@router.post("/pan-name-match")
+async def pan_name_match(req: PanNameMatchRequest):
+    try:
+        case_id = str(uuid.uuid4())
+
+        vendor_response = await fetch_pan_details(
+            pan=req.pan,
+            consent="Y",
+            lite="Y",
+            case_id=case_id
+        )
+
+        api_name = vendor_response.get("result", {}).get("name")
+
+        is_match = fuzzy_name_match(api_name, req.name)
+
+        if is_match:
+            return {
+                "pan": req.pan,
+                "name": api_name,
+                "status": "VALID"
+            }
+
+        return {
+            "pan": req.pan,
+            "name": api_name,
+            "status": "INVALID",
+            "message": "Name does not match"
+        }
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+
+
+
+
+
