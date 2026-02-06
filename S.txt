@@ -1,61 +1,129 @@
-import ijson
-from openpyxl import Workbook
+import asyncio
+import re
+import time
+import logging
+from fastapi import APIRouter, HTTPException
 
-input_json = "input.json"
-output_excel = "output.xlsx"
-records_per_sheet = 500000  # keep fixed as requested
+from app.models.bulk_models import BulkPANRequest
+from app.services.pan_service import fetch_pan_details_async
+from app.services.utils import generate_case_id
 
-wb = Workbook(write_only=True)
+router = APIRouter()
+logger = logging.getLogger(__name__)
 
-sheet_number = 1
-row_count = 0
-total_records = 0
-headers = None
-ws = None
+PAN_REGEX = r"^[A-Z]{5}[0-9]{4}[A-Z]$"
 
-with open(input_json, "r", encoding="utf-8") as f:
-    objects = ijson.items(f, "item")  # top-level JSON array
+# ==============================
+# 🔥 GLOBAL PROTECTION (Perfios Safe)
+# ==============================
 
-    for obj in objects:
+MAX_CONCURRENT_CALLS = 2              # Perfios safe
+RATE_LIMIT_PER_SEC = 2                # 2 requests per second
+RATE_INTERVAL = 1 / RATE_LIMIT_PER_SEC
 
-        # Create new sheet when starting or after 5L rows
-        if row_count == 0:
-            ws = wb.create_sheet(title=f"Sheet{sheet_number}")
-            print(f"Created Sheet{sheet_number}")
+GLOBAL_SEMAPHORE = asyncio.Semaphore(MAX_CONCURRENT_CALLS)
+RATE_LOCK = asyncio.Lock()
+LAST_CALL_TIME = 0
 
-            # Set headers only once (based on first record)
-            if headers is None:
-                headers = list(obj.keys())
 
-            ws.append(headers)  # write header row
+async def rate_limited_call(pan: str, case_id: str):
+    """
+    Global rate limiter + concurrency control
+    """
 
-        # Prepare row safely
-        row = []
-        for col in headers:
-            value = obj.get(col, "")
+    global LAST_CALL_TIME
 
-            if value is None:
-                value = ""
+    async with GLOBAL_SEMAPHORE:
 
-            # Convert numeric strings with commas to float (optional safety)
-            if isinstance(value, str) and "," in value:
-                try:
-                    value = float(value.replace(",", ""))
-                except:
-                    pass
+        async with RATE_LOCK:
+            now = time.time()
+            elapsed = now - LAST_CALL_TIME
 
-            row.append(value)
+            if elapsed < RATE_INTERVAL:
+                await asyncio.sleep(RATE_INTERVAL - elapsed)
 
-        ws.append(row)
+            LAST_CALL_TIME = time.time()
 
-        row_count += 1
-        total_records += 1
+        try:
+            return await asyncio.wait_for(
+                fetch_pan_details_async(
+                    pan=pan,
+                    consent="Y",
+                    lite="Y",
+                    case_id=case_id
+                ),
+                timeout=15  # safety timeout
+            )
+        except asyncio.TimeoutError:
+            logger.error(f"Timeout calling Perfios for PAN {pan}")
+            return {"error": "Timeout"}
 
-        # Switch sheet after 5 lakh rows
-        if row_count >= records_per_sheet:
-            sheet_number += 1
-            row_count = 0
 
-wb.save(output_excel)
+async def process_single_pan(pan: str):
 
-print(f"✅ Finished. Total records processed: {total_records}")
+    start_time = time.time()
+    case_id = generate_case_id()
+
+    if len(pan) != 10 or not re.match(PAN_REGEX, pan):
+        return {
+            "pan": pan,
+            "name": None,
+            "error": "Invalid PAN format"
+        }
+
+    attempt = 0
+    response = None
+
+    while attempt < 3:
+
+        response = await rate_limited_call(pan, case_id)
+
+        # Handle rate limit
+        if isinstance(response, dict) and response.get("statusCode") == 429:
+            backoff = 2 ** attempt
+            logger.warning(f"429 received for {pan}. Retrying in {backoff}s")
+            await asyncio.sleep(backoff)
+            attempt += 1
+            continue
+
+        # Success
+        if isinstance(response, dict) and "result" in response:
+            duration = round(time.time() - start_time, 2)
+            logger.info(f"PAN {pan} success in {duration}s")
+
+            return {
+                "pan": pan,
+                "name": response["result"].get("name"),
+                "caseId": case_id
+            }
+
+        attempt += 1
+        await asyncio.sleep(1)
+
+    logger.error(f"PAN {pan} failed after retries")
+
+    return {
+        "pan": pan,
+        "name": None,
+        "caseId": case_id,
+        "error": "Failed after 3 attempts"
+    }
+
+
+@router.post("/bulk_pan")
+async def bulk_pan_verification(req: BulkPANRequest):
+
+    if not req.panList:
+        raise HTTPException(status_code=400, detail="panList cannot be empty")
+
+    if len(req.panList) > 50:
+        raise HTTPException(status_code=400, detail="Max 50 PANs allowed per request")
+
+    tasks = [process_single_pan(pan) for pan in req.panList]
+
+    results = await asyncio.gather(*tasks)
+
+    return {
+        "total": len(results),
+        "results": results
+    }
