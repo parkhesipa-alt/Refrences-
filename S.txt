@@ -1,0 +1,61 @@
+import ijson
+from openpyxl import Workbook
+
+input_json = "input.json"
+output_excel = "output.xlsx"
+records_per_sheet = 500000  # keep fixed as requested
+
+wb = Workbook(write_only=True)
+
+sheet_number = 1
+row_count = 0
+total_records = 0
+headers = None
+ws = None
+
+with open(input_json, "r", encoding="utf-8") as f:
+    objects = ijson.items(f, "item")  # top-level JSON array
+
+    for obj in objects:
+
+        # Create new sheet when starting or after 5L rows
+        if row_count == 0:
+            ws = wb.create_sheet(title=f"Sheet{sheet_number}")
+            print(f"Created Sheet{sheet_number}")
+
+            # Set headers only once (based on first record)
+            if headers is None:
+                headers = list(obj.keys())
+
+            ws.append(headers)  # write header row
+
+        # Prepare row safely
+        row = []
+        for col in headers:
+            value = obj.get(col, "")
+
+            if value is None:
+                value = ""
+
+            # Convert numeric strings with commas to float (optional safety)
+            if isinstance(value, str) and "," in value:
+                try:
+                    value = float(value.replace(",", ""))
+                except:
+                    pass
+
+            row.append(value)
+
+        ws.append(row)
+
+        row_count += 1
+        total_records += 1
+
+        # Switch sheet after 5 lakh rows
+        if row_count >= records_per_sheet:
+            sheet_number += 1
+            row_count = 0
+
+wb.save(output_excel)
+
+print(f"✅ Finished. Total records processed: {total_records}")
