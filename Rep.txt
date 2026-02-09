@@ -29,7 +29,7 @@ class GSTPaymentParser:
         return match.group(1)
 
     # -----------------------------
-    # Extract Section (A) Only
+    # Extract Section (A)
     # -----------------------------
     def _extract_section_a(self, text: str) -> str:
         match = re.search(r"\(A\).*?Other than reverse charge(.*?)\(B\)", text, re.DOTALL)
@@ -38,13 +38,34 @@ class GSTPaymentParser:
         return match.group(1)
 
     # -----------------------------
-    # Main Parse Logic
+    # Fix Split Numbers
+    # -----------------------------
+    def _merge_split_numbers(self, text: str) -> str:
+        """
+        Merge numbers like:
+        25026059
+        7.00
+        into:
+        250260597.00
+        """
+        text = re.sub(
+            r'(\d{5,})\s*\n\s*(\d\.\d{2})',
+            r'\1\2',
+            text
+        )
+        return text
+
+    # -----------------------------
+    # Main Parse
     # -----------------------------
     def parse(self) -> Dict[str, float]:
 
         page_text = self._extract_page_text()
         section_6_1 = self._extract_6_1_section(page_text)
         section_a = self._extract_section_a(section_6_1)
+
+        # Fix broken numbers first
+        section_a = self._merge_split_numbers(section_a)
 
         lines = [line.strip() for line in section_a.split("\n") if line.strip()]
 
@@ -57,15 +78,14 @@ class GSTPaymentParser:
 
                 tax_type = words[0]
                 if tax_type != "Cess":
-                    tax_type = tax_type + " tax"
+                    tax_type += " tax"
 
                 numbers = re.findall(r'\d+\.\d+|\d+', line)
 
-                # We expect at least 7 numeric columns
-                if len(numbers) < 7:
-                    continue
+                # Ensure minimum columns
+                while len(numbers) < 7:
+                    numbers.append("0")
 
-                # Column mapping based on GST layout
                 itc_integrated = float(numbers[3])
                 itc_central = float(numbers[4])
                 itc_state = float(numbers[5])
@@ -78,7 +98,6 @@ class GSTPaymentParser:
                     itc_cess
                 ]
 
-                # Own column index mapping
                 own_column_map = {
                     "Integrated tax": 0,
                     "Central tax": 1,
@@ -92,11 +111,11 @@ class GSTPaymentParser:
                 # CROSS-UTILISATION LOGIC
                 # -----------------------------
 
-                # If value is in OWN ITC column → ignore
+                # If value exists in own ITC column → ignore
                 if itc_values[own_index] != 0:
                     result[tax_type] = 0.0
                 else:
-                    # Take value from any OTHER ITC column
+                    # Take value from other ITC columns
                     cross_value = 0.0
                     for idx, val in enumerate(itc_values):
                         if idx != own_index and val != 0:
@@ -104,6 +123,11 @@ class GSTPaymentParser:
                             break
 
                     result[tax_type] = cross_value
+
+        # Ensure all tax types appear
+        for tax in ["Integrated tax", "Central tax", "State/UT tax", "Cess"]:
+            if tax not in result:
+                result[tax] = 0.0
 
         return result
 
