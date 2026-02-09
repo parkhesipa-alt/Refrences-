@@ -3,143 +3,144 @@ import re
 from typing import Dict
 
 
-class GSTPaymentParser:
-    """
-    Extracts ITC amounts from:
-    6.1 Payment of tax → (A) Other than reverse charge
-    Ignores Section (B)
-    """
-
+class GSTPaymentParserDebug:
     TAX_TYPES = ["Integrated tax", "Central tax", "State/UT tax", "Cess"]
 
     def __init__(self, pdf_path: str):
         self.pdf_path = pdf_path
 
-    # -------------------------------------
-    # Step 1: Extract Page 2 Text
-    # -------------------------------------
-    def _extract_page_text(self) -> str:
+    def parse(self) -> Dict[str, float]:
+
+        # -----------------------------
+        # 1. Extract Page 2
+        # -----------------------------
+        print("\n========= STEP 1: PAGE 2 TEXT =========\n")
+
         with pdfplumber.open(self.pdf_path) as pdf:
             if len(pdf.pages) < 2:
                 raise ValueError("PDF does not contain Page 2.")
-            text = pdf.pages[1].extract_text()
+            page_text = pdf.pages[1].extract_text()
 
-        if not text:
-            raise ValueError("Unable to extract text from Page 2.")
+        print(page_text)
 
-        return text
+        # -----------------------------
+        # 2. Extract 6.1 Section
+        # -----------------------------
+        print("\n========= STEP 2: 6.1 SECTION =========\n")
 
-    # -------------------------------------
-    # Step 2: Extract 6.1 Section
-    # -------------------------------------
-    def _extract_6_1_section(self, text: str) -> str:
-        pattern = r"6\.1\s+Payment of tax(.*?)(6\.2|$)"
-        match = re.search(pattern, text, re.DOTALL)
+        match_6_1 = re.search(r"6\.1\s+Payment of tax(.*?)(6\.2|$)", page_text, re.DOTALL)
 
-        if not match:
-            raise ValueError("'6.1 Payment of tax' section not found.")
+        if not match_6_1:
+            raise ValueError("6.1 section not found.")
 
-        return match.group(1)
+        section_6_1 = match_6_1.group(1)
+        print(section_6_1)
 
-    # -------------------------------------
-    # Step 3: Extract Only Section (A)
-    # -------------------------------------
-    def _extract_section_a(self, text: str) -> str:
-        pattern = r"\(A\)\s+Other than reverse charge(.*?)\(B\)"
-        match = re.search(pattern, text, re.DOTALL)
+        # -----------------------------
+        # 3. Extract Section A
+        # -----------------------------
+        print("\n========= STEP 3: SECTION (A) =========\n")
 
-        if not match:
-            raise ValueError("Section (A) not found.")
+        match_a = re.search(r"\(A\).*?Other than reverse charge(.*?)\(B\)", section_6_1, re.DOTALL)
 
-        return match.group(1)
+        if not match_a:
+            raise ValueError("Section A not found.")
 
-    # -------------------------------------
-    # Step 4: Clean Text
-    # -------------------------------------
-    def _clean_text(self, text: str) -> str:
-        # Join broken numbers
-        text = re.sub(r'(\d+)\s*\n\s*(\d+\.\d+)', r'\1\2', text)
+        section_a = match_a.group(1)
+        print(section_a)
 
-        # Replace '-' placeholders with 0
-        text = text.replace(" - ", " 0 ")
+        # -----------------------------
+        # 4. Split Into Lines
+        # -----------------------------
+        print("\n========= STEP 4: LINES =========\n")
 
-        # Normalize whitespace
-        text = re.sub(r'\s+', ' ', text)
+        lines = [line.strip() for line in section_a.split("\n") if line.strip()]
 
-        return text.strip()
+        for idx, line in enumerate(lines):
+            print(f"{idx} -> {line}")
 
-    # -------------------------------------
-    # Step 5: Extract Rows
-    # -------------------------------------
-    def _extract_rows(self, text: str):
-        pattern = r"(Integrated tax|Central tax|State/UT tax|Cess)\s+([0-9\.\s\-]+)"
-        return re.findall(pattern, text)
-
-    # -------------------------------------
-    # Step 6: ITC Extraction Logic
-    # -------------------------------------
-    def _extract_itc_amount(self, desc: str, numbers_str: str) -> float:
-        nums = re.findall(r'\d+\.\d+|\d+', numbers_str)
-
-        if len(nums) < 7:
-            return 0.0
-
-        # Column positions
-        itc_integrated = float(nums[3])
-        itc_central = float(nums[4])
-        itc_state = float(nums[5])
-        itc_cess = float(nums[6])
-
-        primary_map = {
-            "Integrated tax": itc_integrated,
-            "Central tax": itc_central,
-            "State/UT tax": itc_state,
-            "Cess": itc_cess
-        }
-
-        primary_value = primary_map.get(desc, 0.0)
-
-        # Prefer correct column
-        if primary_value != 0:
-            return primary_value
-
-        # Fallback → first non-zero ITC column
-        for value in [itc_integrated, itc_central, itc_state, itc_cess]:
-            if value != 0:
-                return value
-
-        return 0.0
-
-    # -------------------------------------
-    # Public Method
-    # -------------------------------------
-    def parse(self) -> Dict[str, float]:
-        page_text = self._extract_page_text()
-        section_6_1 = self._extract_6_1_section(page_text)
-        section_a = self._extract_section_a(section_6_1)
-        cleaned_text = self._clean_text(section_a)
-        rows = self._extract_rows(cleaned_text)
+        # -----------------------------
+        # 5. Row Extraction
+        # -----------------------------
+        print("\n========= STEP 5: ROW PARSING =========\n")
 
         result = {}
+        i = 0
 
-        for desc, numbers_str in rows:
-            if desc in self.TAX_TYPES:
-                result[desc] = self._extract_itc_amount(desc, numbers_str)
+        while i < len(lines):
+            line = lines[i]
+
+            if line in self.TAX_TYPES:
+                print(f"\n--- Found Tax Type: {line} ---")
+
+                desc = line
+                numbers = []
+                j = i + 1
+
+                while j < len(lines) and re.search(r'\d', lines[j]):
+                    print(f"Collecting numbers from line {j}: {lines[j]}")
+                    found_nums = re.findall(r'\d+\.\d+|\d+', lines[j])
+                    print("Extracted numbers:", found_nums)
+                    numbers.extend(found_nums)
+                    j += 1
+
+                print("All numbers collected for this row:", numbers)
+
+                if len(numbers) >= 7:
+                    itc_integrated = float(numbers[3])
+                    itc_central = float(numbers[4])
+                    itc_state = float(numbers[5])
+                    itc_cess = float(numbers[6])
+
+                    print("ITC Integrated:", itc_integrated)
+                    print("ITC Central   :", itc_central)
+                    print("ITC State/UT  :", itc_state)
+                    print("ITC Cess      :", itc_cess)
+
+                    primary_map = {
+                        "Integrated tax": itc_integrated,
+                        "Central tax": itc_central,
+                        "State/UT tax": itc_state,
+                        "Cess": itc_cess
+                    }
+
+                    primary_value = primary_map[desc]
+
+                    if primary_value != 0:
+                        print("Using PRIMARY column value.")
+                        result[desc] = primary_value
+                    else:
+                        print("Primary is 0 → Checking fallback columns...")
+                        fallback_found = False
+                        for val in [itc_integrated, itc_central, itc_state, itc_cess]:
+                            if val != 0:
+                                print("Using FALLBACK value:", val)
+                                result[desc] = val
+                                fallback_found = True
+                                break
+
+                        if not fallback_found:
+                            print("All ITC columns are 0.")
+                            result[desc] = 0.0
+
+                else:
+                    print("Not enough numbers detected for this row.")
+
+                i = j
+            else:
+                i += 1
+
+        print("\n========= FINAL RESULT =========\n")
+        print(result)
 
         return result
 
 
-# -------------------------------------
-# Usage
-# -------------------------------------
+# -----------------------------
+# RUN
+# -----------------------------
 if __name__ == "__main__":
-    pdf_file = "gst_file.pdf"  # Replace with your file path
-    parser = GSTPaymentParser(pdf_file)
+    pdf_file = r"yourfile.pdf"
 
-    try:
-        data = parser.parse()
-        print("\nExtracted ITC (Section A Only):")
-        for key, value in data.items():
-            print(f"{key}: {value}")
-    except Exception as e:
-        print("Error:", str(e))
+    parser = GSTPaymentParserDebug(pdf_file)
+    parser.parse()
