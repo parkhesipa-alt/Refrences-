@@ -1,125 +1,109 @@
 import pdfplumber
 import re
+from typing import Dict
 
 
-class GSTPaymentParserDebug:
+class GSTPaymentParser:
 
     TAX_STARTERS = ["Integrated", "Central", "State/UT", "Cess"]
 
     def __init__(self, pdf_path: str):
         self.pdf_path = pdf_path
 
-    def parse(self):
-
-        print("\n================ STEP 1: PAGE 2 TEXT ================\n")
-
+    # -----------------------------
+    # Extract Page 2
+    # -----------------------------
+    def _extract_page_text(self) -> str:
         with pdfplumber.open(self.pdf_path) as pdf:
             if len(pdf.pages) < 2:
                 raise ValueError("PDF does not contain Page 2.")
-            page_text = pdf.pages[1].extract_text()
+            return pdf.pages[1].extract_text()
 
-        print(page_text)
+    # -----------------------------
+    # Extract 6.1 Section
+    # -----------------------------
+    def _extract_6_1_section(self, text: str) -> str:
+        match = re.search(r"6\.1\s+Payment of tax(.*?)(6\.2|$)", text, re.DOTALL)
+        if not match:
+            raise ValueError("6.1 section not found.")
+        return match.group(1)
 
-        print("\n================ STEP 2: EXTRACT 6.1 SECTION ================\n")
+    # -----------------------------
+    # Extract Section (A) Only
+    # -----------------------------
+    def _extract_section_a(self, text: str) -> str:
+        match = re.search(r"\(A\).*?Other than reverse charge(.*?)\(B\)", text, re.DOTALL)
+        if not match:
+            raise ValueError("Section (A) not found.")
+        return match.group(1)
 
-        match_6_1 = re.search(r"6\.1\s+Payment of tax(.*?)(6\.2|$)", page_text, re.DOTALL)
-        if not match_6_1:
-            raise ValueError("6.1 section not found")
+    # -----------------------------
+    # Main Parse Logic
+    # -----------------------------
+    def parse(self) -> Dict[str, float]:
 
-        section_6_1 = match_6_1.group(1)
-        print(section_6_1)
-
-        print("\n================ STEP 3: EXTRACT SECTION (A) ================\n")
-
-        match_a = re.search(r"\(A\).*?Other than reverse charge(.*?)\(B\)", section_6_1, re.DOTALL)
-        if not match_a:
-            raise ValueError("Section A not found")
-
-        section_a = match_a.group(1)
-        print(section_a)
-
-        print("\n================ STEP 4: SPLIT LINES ================\n")
+        page_text = self._extract_page_text()
+        section_6_1 = self._extract_6_1_section(page_text)
+        section_a = self._extract_section_a(section_6_1)
 
         lines = [line.strip() for line in section_a.split("\n") if line.strip()]
 
-        for idx, line in enumerate(lines):
-            print(f"{idx} -> {line}")
-
-        print("\n================ STEP 5: ROW PARSING ================\n")
-
         result = {}
 
-        for idx, line in enumerate(lines):
-
+        for line in lines:
             words = line.split()
 
             if words and words[0] in self.TAX_STARTERS:
 
                 tax_type = words[0]
-
                 if tax_type != "Cess":
                     tax_type = tax_type + " tax"
 
-                print(f"\n------ Detected Tax Row: {tax_type} ------")
-                print("Raw Line:", line)
-
                 numbers = re.findall(r'\d+\.\d+|\d+', line)
-                print("Extracted Numbers:", numbers)
 
+                # We expect at least 7 numeric columns
                 if len(numbers) < 7:
-                    print("⚠ Not enough numeric columns detected.")
                     continue
 
-                # Column mapping
-                tax_payable = float(numbers[0])
-                adjustment = float(numbers[1])
-                net_tax_payable = float(numbers[2])
-
+                # Column mapping based on GST layout
                 itc_integrated = float(numbers[3])
                 itc_central = float(numbers[4])
                 itc_state = float(numbers[5])
                 itc_cess = float(numbers[6])
 
-                print("\n--- Column Mapping ---")
-                print("Tax Payable       :", tax_payable)
-                print("Adjustment        :", adjustment)
-                print("Net Tax Payable   :", net_tax_payable)
-                print("ITC Integrated    :", itc_integrated)
-                print("ITC Central       :", itc_central)
-                print("ITC State/UT      :", itc_state)
-                print("ITC Cess          :", itc_cess)
+                itc_values = [
+                    itc_integrated,
+                    itc_central,
+                    itc_state,
+                    itc_cess
+                ]
 
-                primary_map = {
-                    "Integrated tax": itc_integrated,
-                    "Central tax": itc_central,
-                    "State/UT tax": itc_state,
-                    "Cess": itc_cess
+                # Own column index mapping
+                own_column_map = {
+                    "Integrated tax": 0,
+                    "Central tax": 1,
+                    "State/UT tax": 2,
+                    "Cess": 3
                 }
 
-                primary_value = primary_map[tax_type]
+                own_index = own_column_map[tax_type]
 
-                print("\n--- Decision Logic ---")
+                # -----------------------------
+                # CROSS-UTILISATION LOGIC
+                # -----------------------------
 
-                if primary_value != 0:
-                    print("Using PRIMARY column value:", primary_value)
-                    result[tax_type] = primary_value
+                # If value is in OWN ITC column → ignore
+                if itc_values[own_index] != 0:
+                    result[tax_type] = 0.0
                 else:
-                    print("Primary is 0 → Checking fallback columns")
-                    fallback_used = False
-
-                    for val in [itc_integrated, itc_central, itc_state, itc_cess]:
-                        if val != 0:
-                            print("Using FALLBACK value:", val)
-                            result[tax_type] = val
-                            fallback_used = True
+                    # Take value from any OTHER ITC column
+                    cross_value = 0.0
+                    for idx, val in enumerate(itc_values):
+                        if idx != own_index and val != 0:
+                            cross_value = val
                             break
 
-                    if not fallback_used:
-                        print("All ITC columns are 0.")
-                        result[tax_type] = 0.0
-
-        print("\n================ FINAL RESULT ================\n")
-        print(result)
+                    result[tax_type] = cross_value
 
         return result
 
@@ -130,147 +114,11 @@ class GSTPaymentParserDebug:
 if __name__ == "__main__":
     pdf_file = r"yourfile.pdf"
 
-    parser = GSTPaymentParserDebug(pdf_file)
-    parser.parse()
+    parser = GSTPaymentParser(pdf_file)
 
-
-
-
-
-
-
-
-
-
-
-
-
-import pdfplumber
-import re
-
-
-class GSTPaymentParserAuto:
-
-    def __init__(self, pdf_path: str):
-        self.pdf_path = pdf_path
-
-    def parse(self):
-
-        with pdfplumber.open(self.pdf_path) as pdf:
-            page_text = pdf.pages[1].extract_text()
-
-        # Extract 6.1
-        section_6_1 = re.search(
-            r"6\.1\s+Payment of tax(.*?)(6\.2|$)",
-            page_text,
-            re.DOTALL
-        ).group(1)
-
-        # Extract Section A
-        section_a = re.search(
-            r"\(A\).*?Other than reverse charge(.*?)\(B\)",
-            section_6_1,
-            re.DOTALL
-        ).group(1)
-
-        lines = [l.rstrip() for l in section_a.split("\n") if l.strip()]
-
-        print("\n========== HEADER DETECTION ==========\n")
-
-        # Find header line that contains ITC column names
-        header_line = None
-        for line in lines:
-            if "Integrated" in line and "Central" in line and "State/UT" in line:
-                header_line = line
-                break
-
-        if not header_line:
-            raise ValueError("ITC header line not found")
-
-        print("Header Line Found:")
-        print(header_line)
-
-        # Detect column start positions dynamically
-        col_positions = {
-            "Integrated": header_line.index("Integrated"),
-            "Central": header_line.index("Central"),
-            "State/UT": header_line.index("State/UT"),
-            "Cess": header_line.index("Cess"),
-        }
-
-        print("\nDetected Column Positions:")
-        for k, v in col_positions.items():
-            print(f"{k}: starts at index {v}")
-
-        print("\n========== ROW PARSING ==========\n")
-
-        result = {}
-
-        TAX_ROWS = ["Integrated", "Central", "State/UT", "Cess"]
-
-        for line in lines:
-
-            for tax in TAX_ROWS:
-
-                if line.startswith(tax):
-
-                    print("\nProcessing Row:", line)
-
-                    # Slice values using column positions
-                    itc_integrated_slice = line[col_positions["Integrated"]:col_positions["Central"]]
-                    itc_central_slice = line[col_positions["Central"]:col_positions["State/UT"]]
-                    itc_state_slice = line[col_positions["State/UT"]:col_positions["Cess"]]
-                    itc_cess_slice = line[col_positions["Cess"]:]
-
-                    # Extract numbers from slices
-                    def extract_number(text):
-                        match = re.search(r'\d+\.\d+|\d+', text)
-                        return float(match.group()) if match else 0.0
-
-                    itc_integrated = extract_number(itc_integrated_slice)
-                    itc_central = extract_number(itc_central_slice)
-                    itc_state = extract_number(itc_state_slice)
-                    itc_cess = extract_number(itc_cess_slice)
-
-                    print("ITC Integrated:", itc_integrated)
-                    print("ITC Central   :", itc_central)
-                    print("ITC State/UT  :", itc_state)
-                    print("ITC Cess      :", itc_cess)
-
-                    tax_label = tax if tax == "Cess" else tax + " tax"
-
-                    primary_map = {
-                        "Integrated tax": itc_integrated,
-                        "Central tax": itc_central,
-                        "State/UT tax": itc_state,
-                        "Cess": itc_cess
-                    }
-
-                    primary_value = primary_map[tax_label]
-
-                    if primary_value != 0:
-                        print("Using PRIMARY:", primary_value)
-                        result[tax_label] = primary_value
-                    else:
-                        print("Primary is 0 → Checking fallback")
-                        for val in [itc_integrated, itc_central, itc_state, itc_cess]:
-                            if val != 0:
-                                print("Using FALLBACK:", val)
-                                result[tax_label] = val
-                                break
-                        else:
-                            result[tax_label] = 0.0
-
-        print("\n========== FINAL RESULT ==========\n")
-        print(result)
-
-        return result
-
-
-# Run
-if __name__ == "__main__":
-    pdf_file = r"yourfile.pdf"
-    parser = GSTPaymentParserAuto(pdf_file)
-    parser.parse()
-
-
+    try:
+        output = parser.parse()
+        print("\nFinal Cross-Utilised ITC Values (Section A Only):")
+        print(output)
+    except Exception as e:
+        print("Error:", e)
