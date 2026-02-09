@@ -1,0 +1,213 @@
+import httpx
+import asyncio
+import os
+import logging
+
+logger = logging.getLogger(__name__)
+
+KARZA_URL = os.getenv("KARZA_URL")
+KARZA_KEY = os.getenv("KARZA_KEY")
+
+# Global client (connection pooling enabled)
+client = httpx.AsyncClient(
+    timeout=httpx.Timeout(10.0, connect=5.0),
+    limits=httpx.Limits(
+        max_keepalive_connections=20,
+        max_connections=50
+    )
+)
+
+
+async def fetch_pan_details_async(pan: str, consent: str, lite: str, case_id: str):
+    payload = {
+        "pan": pan,
+        "lite": lite,
+        "consent": consent,
+        "clientData": {"caseId": case_id}
+    }
+
+    headers = {
+        "Content-Type": "application/json",
+        "x-karza-key": KARZA_KEY
+    }
+
+    try:
+        response = await client.post(
+            KARZA_URL,
+            json=payload,
+            headers=headers
+        )
+
+        if response.status_code == 200:
+            return response.json()
+
+        if response.status_code == 429:
+            return {"statusCode": 429}
+
+        logger.error(
+            "Karza error",
+            extra={
+                "status": response.status_code,
+                "pan": pan,
+                "case_id": case_id
+            }
+        )
+
+        return {"error": response.text}
+
+    except httpx.TimeoutException:
+        logger.error(f"Timeout calling Karza for PAN {pan}")
+        return {"error": "Timeout"}
+
+    except httpx.RequestError as e:
+        logger.error(f"Request error: {str(e)}")
+        return {"error": "Connection error"}
+
+
+
+
+
+
+import asyncio
+import re
+import time
+import logging
+from fastapi import APIRouter, HTTPException
+
+from app.models.bulk_models import BulkPANRequest
+from app.services.pan_service import fetch_pan_details_async
+from app.services.utils import generate_case_id
+
+router = APIRouter()
+logger = logging.getLogger(__name__)
+
+PAN_REGEX = r"^[A-Z]{5}[0-9]{4}[A-Z]$"
+
+# ==============================
+# 🔥 GLOBAL PROTECTION (Perfios Safe)
+# ==============================
+
+MAX_CONCURRENT_CALLS = 2              # Perfios safe
+RATE_LIMIT_PER_SEC = 2                # 2 requests per second
+RATE_INTERVAL = 1 / RATE_LIMIT_PER_SEC
+
+GLOBAL_SEMAPHORE = asyncio.Semaphore(MAX_CONCURRENT_CALLS)
+RATE_LOCK = asyncio.Lock()
+LAST_CALL_TIME = 0
+
+
+async def rate_limited_call(pan: str, case_id: str):
+    """
+    Global rate limiter + concurrency control
+    """
+
+    global LAST_CALL_TIME
+
+    async with GLOBAL_SEMAPHORE:
+
+        async with RATE_LOCK:
+            now = time.time()
+            elapsed = now - LAST_CALL_TIME
+
+            if elapsed < RATE_INTERVAL:
+                await asyncio.sleep(RATE_INTERVAL - elapsed)
+
+            LAST_CALL_TIME = time.time()
+
+        try:
+            return await asyncio.wait_for(
+                fetch_pan_details_async(
+                    pan=pan,
+                    consent="Y",
+                    lite="Y",
+                    case_id=case_id
+                ),
+                timeout=15  # safety timeout
+            )
+        except asyncio.TimeoutError:
+            logger.error(f"Timeout calling Perfios for PAN {pan}")
+            return {"error": "Timeout"}
+
+
+async def process_single_pan(pan: str):
+
+    start_time = time.time()
+    case_id = generate_case_id()
+
+    if len(pan) != 10 or not re.match(PAN_REGEX, pan):
+        return {
+            "pan": pan,
+            "name": None,
+            "error": "Invalid PAN format"
+        }
+
+    attempt = 0
+    response = None
+
+    while attempt < 3:
+
+        response = await rate_limited_call(pan, case_id)
+
+        # Handle rate limit
+        if isinstance(response, dict) and response.get("statusCode") == 429:
+            backoff = 2 ** attempt
+            logger.warning(f"429 received for {pan}. Retrying in {backoff}s")
+            await asyncio.sleep(backoff)
+            attempt += 1
+            continue
+
+        # Success
+        if isinstance(response, dict) and "result" in response:
+            duration = round(time.time() - start_time, 2)
+            logger.info(f"PAN {pan} success in {duration}s")
+
+            return {
+                "pan": pan,
+                "name": response["result"].get("name"),
+                "caseId": case_id
+            }
+
+        attempt += 1
+        await asyncio.sleep(1)
+
+    logger.error(f"PAN {pan} failed after retries")
+
+    return {
+        "pan": pan,
+        "name": None,
+        "caseId": case_id,
+        "error": "Failed after 3 attempts"
+    }
+
+
+@router.post("/bulk_pan")
+async def bulk_pan_verification(req: BulkPANRequest):
+
+    if not req.panList:
+        raise HTTPException(status_code=400, detail="panList cannot be empty")
+
+    if len(req.panList) > 50:
+        raise HTTPException(status_code=400, detail="Max 50 PANs allowed per request")
+
+    tasks = [process_single_pan(pan) for pan in req.panList]
+
+    results = await asyncio.gather(*tasks)
+
+    return {
+        "total": len(results),
+        "results": results
+    }
+
+
+
+
+
+
+
+Thank you for your kind words and encouragement. I am truly honored to receive the Outstanding Performer recognition for 2025.
+
+I’m grateful for the opportunity to contribute to our shared goals and will continue striving to deliver meaningful impact in the years ahead.
+
+Thank you again for your leadership and support.
+
+
