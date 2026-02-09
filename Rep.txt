@@ -1,8 +1,145 @@
-Thank you very much for your kind words and encouragement. I am truly grateful for this recognition.
+import pdfplumber
+import re
+from typing import Dict
 
-This achievement is also a reflection of the strong team and supportive environment I am fortunate to be part of. I would especially like to acknowledge my manager, Ram, whose constant encouragement to think wide and challenge myself has played a significant role in my growth.
 
-I remain committed to contributing meaningfully as we move into this next phase of growth and delivering consistent impact for the organization.
+class GSTPaymentParser:
+    """
+    Extracts ITC amounts from:
+    6.1 Payment of tax → (A) Other than reverse charge
+    Ignores Section (B)
+    """
 
-Thank you once again for your guidance and leadership.
+    TAX_TYPES = ["Integrated tax", "Central tax", "State/UT tax", "Cess"]
 
+    def __init__(self, pdf_path: str):
+        self.pdf_path = pdf_path
+
+    # -------------------------------------
+    # Step 1: Extract Page 2 Text
+    # -------------------------------------
+    def _extract_page_text(self) -> str:
+        with pdfplumber.open(self.pdf_path) as pdf:
+            if len(pdf.pages) < 2:
+                raise ValueError("PDF does not contain Page 2.")
+            text = pdf.pages[1].extract_text()
+
+        if not text:
+            raise ValueError("Unable to extract text from Page 2.")
+
+        return text
+
+    # -------------------------------------
+    # Step 2: Extract 6.1 Section
+    # -------------------------------------
+    def _extract_6_1_section(self, text: str) -> str:
+        pattern = r"6\.1\s+Payment of tax(.*?)(6\.2|$)"
+        match = re.search(pattern, text, re.DOTALL)
+
+        if not match:
+            raise ValueError("'6.1 Payment of tax' section not found.")
+
+        return match.group(1)
+
+    # -------------------------------------
+    # Step 3: Extract Only Section (A)
+    # -------------------------------------
+    def _extract_section_a(self, text: str) -> str:
+        pattern = r"\(A\)\s+Other than reverse charge(.*?)\(B\)"
+        match = re.search(pattern, text, re.DOTALL)
+
+        if not match:
+            raise ValueError("Section (A) not found.")
+
+        return match.group(1)
+
+    # -------------------------------------
+    # Step 4: Clean Text
+    # -------------------------------------
+    def _clean_text(self, text: str) -> str:
+        # Join broken numbers
+        text = re.sub(r'(\d+)\s*\n\s*(\d+\.\d+)', r'\1\2', text)
+
+        # Replace '-' placeholders with 0
+        text = text.replace(" - ", " 0 ")
+
+        # Normalize whitespace
+        text = re.sub(r'\s+', ' ', text)
+
+        return text.strip()
+
+    # -------------------------------------
+    # Step 5: Extract Rows
+    # -------------------------------------
+    def _extract_rows(self, text: str):
+        pattern = r"(Integrated tax|Central tax|State/UT tax|Cess)\s+([0-9\.\s\-]+)"
+        return re.findall(pattern, text)
+
+    # -------------------------------------
+    # Step 6: ITC Extraction Logic
+    # -------------------------------------
+    def _extract_itc_amount(self, desc: str, numbers_str: str) -> float:
+        nums = re.findall(r'\d+\.\d+|\d+', numbers_str)
+
+        if len(nums) < 7:
+            return 0.0
+
+        # Column positions
+        itc_integrated = float(nums[3])
+        itc_central = float(nums[4])
+        itc_state = float(nums[5])
+        itc_cess = float(nums[6])
+
+        primary_map = {
+            "Integrated tax": itc_integrated,
+            "Central tax": itc_central,
+            "State/UT tax": itc_state,
+            "Cess": itc_cess
+        }
+
+        primary_value = primary_map.get(desc, 0.0)
+
+        # Prefer correct column
+        if primary_value != 0:
+            return primary_value
+
+        # Fallback → first non-zero ITC column
+        for value in [itc_integrated, itc_central, itc_state, itc_cess]:
+            if value != 0:
+                return value
+
+        return 0.0
+
+    # -------------------------------------
+    # Public Method
+    # -------------------------------------
+    def parse(self) -> Dict[str, float]:
+        page_text = self._extract_page_text()
+        section_6_1 = self._extract_6_1_section(page_text)
+        section_a = self._extract_section_a(section_6_1)
+        cleaned_text = self._clean_text(section_a)
+        rows = self._extract_rows(cleaned_text)
+
+        result = {}
+
+        for desc, numbers_str in rows:
+            if desc in self.TAX_TYPES:
+                result[desc] = self._extract_itc_amount(desc, numbers_str)
+
+        return result
+
+
+# -------------------------------------
+# Usage
+# -------------------------------------
+if __name__ == "__main__":
+    pdf_file = "gst_file.pdf"  # Replace with your file path
+    parser = GSTPaymentParser(pdf_file)
+
+    try:
+        data = parser.parse()
+        print("\nExtracted ITC (Section A Only):")
+        for key, value in data.items():
+            print(f"{key}: {value}")
+    except Exception as e:
+        print("Error:", str(e))
