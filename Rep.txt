@@ -132,3 +132,145 @@ if __name__ == "__main__":
 
     parser = GSTPaymentParserDebug(pdf_file)
     parser.parse()
+
+
+
+
+
+
+
+
+
+
+
+
+
+import pdfplumber
+import re
+
+
+class GSTPaymentParserAuto:
+
+    def __init__(self, pdf_path: str):
+        self.pdf_path = pdf_path
+
+    def parse(self):
+
+        with pdfplumber.open(self.pdf_path) as pdf:
+            page_text = pdf.pages[1].extract_text()
+
+        # Extract 6.1
+        section_6_1 = re.search(
+            r"6\.1\s+Payment of tax(.*?)(6\.2|$)",
+            page_text,
+            re.DOTALL
+        ).group(1)
+
+        # Extract Section A
+        section_a = re.search(
+            r"\(A\).*?Other than reverse charge(.*?)\(B\)",
+            section_6_1,
+            re.DOTALL
+        ).group(1)
+
+        lines = [l.rstrip() for l in section_a.split("\n") if l.strip()]
+
+        print("\n========== HEADER DETECTION ==========\n")
+
+        # Find header line that contains ITC column names
+        header_line = None
+        for line in lines:
+            if "Integrated" in line and "Central" in line and "State/UT" in line:
+                header_line = line
+                break
+
+        if not header_line:
+            raise ValueError("ITC header line not found")
+
+        print("Header Line Found:")
+        print(header_line)
+
+        # Detect column start positions dynamically
+        col_positions = {
+            "Integrated": header_line.index("Integrated"),
+            "Central": header_line.index("Central"),
+            "State/UT": header_line.index("State/UT"),
+            "Cess": header_line.index("Cess"),
+        }
+
+        print("\nDetected Column Positions:")
+        for k, v in col_positions.items():
+            print(f"{k}: starts at index {v}")
+
+        print("\n========== ROW PARSING ==========\n")
+
+        result = {}
+
+        TAX_ROWS = ["Integrated", "Central", "State/UT", "Cess"]
+
+        for line in lines:
+
+            for tax in TAX_ROWS:
+
+                if line.startswith(tax):
+
+                    print("\nProcessing Row:", line)
+
+                    # Slice values using column positions
+                    itc_integrated_slice = line[col_positions["Integrated"]:col_positions["Central"]]
+                    itc_central_slice = line[col_positions["Central"]:col_positions["State/UT"]]
+                    itc_state_slice = line[col_positions["State/UT"]:col_positions["Cess"]]
+                    itc_cess_slice = line[col_positions["Cess"]:]
+
+                    # Extract numbers from slices
+                    def extract_number(text):
+                        match = re.search(r'\d+\.\d+|\d+', text)
+                        return float(match.group()) if match else 0.0
+
+                    itc_integrated = extract_number(itc_integrated_slice)
+                    itc_central = extract_number(itc_central_slice)
+                    itc_state = extract_number(itc_state_slice)
+                    itc_cess = extract_number(itc_cess_slice)
+
+                    print("ITC Integrated:", itc_integrated)
+                    print("ITC Central   :", itc_central)
+                    print("ITC State/UT  :", itc_state)
+                    print("ITC Cess      :", itc_cess)
+
+                    tax_label = tax if tax == "Cess" else tax + " tax"
+
+                    primary_map = {
+                        "Integrated tax": itc_integrated,
+                        "Central tax": itc_central,
+                        "State/UT tax": itc_state,
+                        "Cess": itc_cess
+                    }
+
+                    primary_value = primary_map[tax_label]
+
+                    if primary_value != 0:
+                        print("Using PRIMARY:", primary_value)
+                        result[tax_label] = primary_value
+                    else:
+                        print("Primary is 0 → Checking fallback")
+                        for val in [itc_integrated, itc_central, itc_state, itc_cess]:
+                            if val != 0:
+                                print("Using FALLBACK:", val)
+                                result[tax_label] = val
+                                break
+                        else:
+                            result[tax_label] = 0.0
+
+        print("\n========== FINAL RESULT ==========\n")
+        print(result)
+
+        return result
+
+
+# Run
+if __name__ == "__main__":
+    pdf_file = r"yourfile.pdf"
+    parser = GSTPaymentParserAuto(pdf_file)
+    parser.parse()
+
+
