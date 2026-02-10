@@ -1,11 +1,58 @@
-def _extract_gstin(self) -> str:
-    with pdfplumber.open(self.pdf_path) as pdf:
-        page = pdf.pages[0]
-        tables = page.extract_tables()
+def _normalize_text(self, text: str) -> str:
+    lines = [l.strip() for l in text.split("\n") if l.strip()]
+    merged_lines = []
+    i = 0
 
-    for table in tables:
-        for row in table:
-            if row and "GSTIN of the supplier" in str(row[0]):
-                return row[1].strip()
+    while i < len(lines):
+        current = lines[i]
 
-    raise ValueError("GSTIN not found in table")
+        # Detect row split:
+        # Central ....
+        # tax 7.00 7.00 7.00
+
+        if (
+            i + 1 < len(lines)
+            and current.split()[0] in ["Integrated", "Central", "State/UT"]
+            and lines[i + 1].startswith("tax")
+        ):
+            first_parts = current.split()
+            second_parts = lines[i + 1].split()[1:]
+
+            merged = []
+            sec_index = 0
+
+            for part in first_parts:
+
+                if part.isdigit() and sec_index < len(second_parts):
+
+                    decimal = second_parts[sec_index]
+
+                    # Case 1: full decimal like 7.00 or 123.456
+                    if re.fullmatch(r"\d+\.\d+", decimal):
+                        merged.append(part + decimal)
+                        sec_index += 1
+
+                    # Case 2: decimal starting with dot like .700
+                    elif re.fullmatch(r"\.\d+", decimal):
+                        merged.append(part + decimal)
+                        sec_index += 1
+
+                    # Case 3: number ending with dot like 6140352. + 00
+                    elif part.endswith(".") and re.fullmatch(r"\d+", decimal):
+                        merged.append(part + decimal)
+                        sec_index += 1
+
+                    else:
+                        merged.append(part)
+
+                else:
+                    merged.append(part)
+
+            merged_lines.append(" ".join(merged))
+            i += 2
+            continue
+
+        merged_lines.append(current)
+        i += 1
+
+    return "\n".join(merged_lines)
