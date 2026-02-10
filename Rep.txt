@@ -71,3 +71,230 @@ if __name__ == "__main__":
 
 
 
+
+
+
+
+
+
+import os
+import re
+import glob
+import pdfplumber
+from decimal import Decimal
+from typing import Dict, List
+
+
+class GSTPaymentParser:
+
+    TAX_STARTERS = ["Integrated", "Central", "State/UT", "Cess"]
+
+    def __init__(self, pdf_path: str):
+        self.pdf_path = pdf_path
+
+    # ---------------------------------------------------
+    # Extract GSTIN from Page 1
+    # ---------------------------------------------------
+    def _extract_gstin(self) -> str:
+        with pdfplumber.open(self.pdf_path) as pdf:
+            first_page_text = pdf.pages[0].extract_text()
+
+        match = re.search(r"\b\d{2}[A-Z]{5}\d{4}[A-Z]\d[A-Z0-9]\b", first_page_text)
+        if not match:
+            raise ValueError("GSTIN not found")
+
+        return match.group(0)
+
+    # ---------------------------------------------------
+    # Extract Page 2 Text
+    # ---------------------------------------------------
+    def _extract_page_text(self) -> str:
+        with pdfplumber.open(self.pdf_path) as pdf:
+            if len(pdf.pages) < 2:
+                raise ValueError("PDF does not contain Page 2")
+            return pdf.pages[1].extract_text()
+
+    # ---------------------------------------------------
+    # Extract 6.1 Section
+    # ---------------------------------------------------
+    def _extract_6_1_section(self, text: str) -> str:
+        match = re.search(r"6\.1\s+Payment of tax(.*?)(6\.2|$)", text, re.DOTALL)
+        if not match:
+            raise ValueError("6.1 section not found")
+        return match.group(1)
+
+    # ---------------------------------------------------
+    # Extract Section A
+    # ---------------------------------------------------
+    def _extract_section_a(self, text: str) -> str:
+        match = re.search(r"\(A\).*?Other than reverse charge(.*?)(\(B\)|$)", text, re.DOTALL)
+        if not match:
+            raise ValueError("Section A not found")
+        return match.group(1)
+
+    # ---------------------------------------------------
+    # FIX: Merge Split Rows (Central + tax)
+    # ---------------------------------------------------
+    def _normalize_text(self, text: str) -> str:
+        lines = [l.strip() for l in text.split("\n") if l.strip()]
+        merged_lines = []
+        i = 0
+
+        while i < len(lines):
+            current = lines[i]
+
+            # Detect row split:
+            # Central ....
+            # tax 7.00 7.00 7.00
+
+            if (
+                i + 1 < len(lines)
+                and current.split()[0] in ["Integrated", "Central", "State/UT"]
+                and lines[i + 1].startswith("tax")
+            ):
+                first_parts = current.split()
+                second_parts = lines[i + 1].split()[1:]
+
+                merged = []
+                sec_index = 0
+
+                for part in first_parts:
+                    if part.isdigit() and sec_index < len(second_parts):
+                        decimal = second_parts[sec_index]
+                        if re.fullmatch(r"\d+\.\d+", decimal):
+                            merged_number = part + decimal.replace(".", "")
+                            merged_number = merged_number[:-2] + "." + merged_number[-2:]
+                            merged.append(merged_number)
+                            sec_index += 1
+                        else:
+                            merged.append(part)
+                    else:
+                        merged.append(part)
+
+                merged_lines.append(" ".join(merged))
+                i += 2
+                continue
+
+            merged_lines.append(current)
+            i += 1
+
+        return "\n".join(merged_lines)
+
+    # ---------------------------------------------------
+    # MAIN PARSER
+    # ---------------------------------------------------
+    def parse(self) -> Dict[str, Decimal]:
+
+        gstin = self._extract_gstin()
+
+        page_text = self._extract_page_text()
+        section_6_1 = self._extract_6_1_section(page_text)
+        section_a = self._extract_section_a(section_6_1)
+
+        # Normalize broken rows
+        section_a = self._normalize_text(section_a)
+
+        lines = [line.strip() for line in section_a.split("\n") if line.strip()]
+
+        result = {}
+
+        for line in lines:
+            words = line.split()
+
+            if words and words[0] in self.TAX_STARTERS:
+
+                tax_type = words[0]
+                if tax_type != "Cess":
+                    tax_type += " tax"
+
+                numbers = re.findall(r"\d+\.\d+|\d+", line)
+
+                while len(numbers) < 7:
+                    numbers.append("0")
+
+                itc_integrated = Decimal(numbers[3])
+                itc_central = Decimal(numbers[4])
+                itc_state = Decimal(numbers[5])
+                itc_cess = Decimal(numbers[6])
+
+                itc_values = [
+                    itc_integrated,
+                    itc_central,
+                    itc_state,
+                    itc_cess
+                ]
+
+                own_column_map = {
+                    "Integrated tax": 0,
+                    "Central tax": 1,
+                    "State/UT tax": 2,
+                    "Cess": 3
+                }
+
+                own_index = own_column_map[tax_type]
+
+                # Cross-utilisation rule
+                if itc_values[own_index] != Decimal("0"):
+                    result[tax_type] = Decimal("0.00")
+                else:
+                    cross_value = Decimal("0.00")
+                    for idx, val in enumerate(itc_values):
+                        if idx != own_index and val != Decimal("0"):
+                            cross_value = val
+                            break
+                    result[tax_type] = cross_value
+
+        # Ensure all present
+        for tax in ["Integrated tax", "Central tax", "State/UT tax", "Cess"]:
+            if tax not in result:
+                result[tax] = Decimal("0.00")
+
+        result["GSTIN"] = gstin
+
+        return result
+
+
+# ---------------------------------------------------
+# PROCESS MULTIPLE PDFs IN FOLDER
+# ---------------------------------------------------
+
+def process_folder(folder_path: str) -> List[Dict]:
+
+    results = []
+    pdf_files = glob.glob(os.path.join(folder_path, "*.pdf"))
+
+    for pdf_path in pdf_files:
+        file_name = os.path.basename(pdf_path)
+        print(f"Processing: {file_name}")
+
+        try:
+            parser = GSTPaymentParser(pdf_path)
+            data = parser.parse()
+            data["file_name"] = file_name
+            results.append(data)
+        except Exception as e:
+            print(f"Error in {file_name}: {e}")
+
+    return results
+
+
+# ---------------------------------------------------
+# RUN
+# ---------------------------------------------------
+
+if __name__ == "__main__":
+
+    folder_path = r"C:\Users\YourPath\GST NEFT"
+
+    all_results = process_folder(folder_path)
+
+    print("\nFINAL OUTPUT\n")
+
+    for record in all_results:
+        print("-" * 60)
+        for k, v in record.items():
+            if isinstance(v, Decimal):
+                print(f"{k}: {format(v, 'f')}")
+            else:
+                print(f"{k}: {v}")
+
