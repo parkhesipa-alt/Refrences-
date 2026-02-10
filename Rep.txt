@@ -1,172 +1,45 @@
-import pdfplumber
-import re
-from typing import Dict
+def _normalize_text(self, text: str) -> str:
+    lines = text.split("\n")
+    merged_lines = []
+    i = 0
 
+    while i < len(lines):
+        current = lines[i].strip()
 
-class GSTPaymentParser:
+        # --------------------------------------------------
+        # FIX 1: Merge broken tax labels
+        # Example:
+        # Central
+        # tax
+        # --------------------------------------------------
+        if (
+            i + 1 < len(lines)
+            and current in ["Integrated", "Central", "State/UT"]
+            and lines[i + 1].strip() == "tax"
+        ):
+            merged_lines.append(current + " tax")
+            i += 2
+            continue
 
-    TAX_STARTERS = ["Integrated", "Central", "State/UT", "Cess"]
+        # --------------------------------------------------
+        # FIX 2: Merge split numbers like:
+        # 25026059
+        # 7.00
+        # --------------------------------------------------
+        if i + 1 < len(lines):
+            next_line = lines[i + 1].strip()
 
-    def __init__(self, pdf_path: str):
-        self.pdf_path = pdf_path
+            whole_match = re.fullmatch(r"\d+", current)
+            decimal_match = re.fullmatch(r"\d+\.\d+", next_line)
 
-    # -------------------------------------------------
-    # Extract Page 2
-    # -------------------------------------------------
-    def _extract_page_text(self) -> str:
-        with pdfplumber.open(self.pdf_path) as pdf:
-            if len(pdf.pages) < 2:
-                raise ValueError("PDF does not contain Page 2.")
-            return pdf.pages[1].extract_text()
-
-    # -------------------------------------------------
-    # Extract 6.1 Section
-    # -------------------------------------------------
-    def _extract_6_1_section(self, text: str) -> str:
-        match = re.search(r"6\.1\s+Payment of tax(.*?)(6\.2|$)", text, re.DOTALL)
-        if not match:
-            raise ValueError("6.1 section not found.")
-        return match.group(1)
-
-    # -------------------------------------------------
-    # Extract Section A
-    # -------------------------------------------------
-    def _extract_section_a(self, text: str) -> str:
-        match = re.search(r"\(A\)(.*?)(\(B\)|$)", text, re.DOTALL)
-        if not match:
-            raise ValueError("Section (A) not found.")
-        return match.group(1)
-
-    # -------------------------------------------------
-    # Fix broken lines and broken digits
-    # -------------------------------------------------
-    def _fix_broken_lines(self, text: str) -> str:
-        lines = [line.strip() for line in text.split("\n") if line.strip()]
-        merged = []
-        i = 0
-
-        while i < len(lines):
-            current = lines[i]
-
-            # 1️⃣ Merge if next line starts with "tax"
-            if (
-                i + 1 < len(lines)
-                and lines[i + 1].lower().startswith("tax")
-                and any(current.startswith(t) for t in self.TAX_STARTERS)
-            ):
-                current = current + " " + lines[i + 1]
+            if whole_match and decimal_match:
+                merged_number = current + decimal_match.group().replace(".", "")
+                merged_number = merged_number[:-2] + "." + merged_number[-2:]
+                merged_lines.append(merged_number)
                 i += 2
-                merged.append(current)
                 continue
 
-            # 2️⃣ Merge split digits like:
-            # 25026059
-            # 7.00
-            if i + 1 < len(lines):
-                next_line = lines[i + 1]
+        merged_lines.append(current)
+        i += 1
 
-                digit_end = re.search(r"(\d+)$", current)
-                decimal_line = re.match(r"^(\d+\.\d+)$", next_line)
-
-                if digit_end and decimal_line:
-                    combined = digit_end.group(1) + decimal_line.group(1)
-                    current = re.sub(r"(\d+)$", combined, current)
-                    i += 2
-                    merged.append(current)
-                    continue
-
-            merged.append(current)
-            i += 1
-
-        return "\n".join(merged)
-
-    # -------------------------------------------------
-    # MAIN PARSER
-    # -------------------------------------------------
-    def parse(self) -> Dict[str, float]:
-
-        page_text = self._extract_page_text()
-        section_6_1 = self._extract_6_1_section(page_text)
-        section_a = self._extract_section_a(section_6_1)
-
-        # Fix PDF broken layout
-        section_a = self._fix_broken_lines(section_a)
-
-        lines = [line.strip() for line in section_a.split("\n") if line.strip()]
-
-        result = {}
-
-        for line in lines:
-            words = line.split()
-
-            if words and words[0] in self.TAX_STARTERS:
-
-                tax_type = words[0]
-                if tax_type != "Cess":
-                    tax_type += " tax"
-
-                # Extract numbers (supports commas)
-                numbers = re.findall(r"\d[\d,]*\.\d+|\d[\d,]*", line)
-
-                # Remove commas before converting
-                numbers = [n.replace(",", "") for n in numbers]
-
-                while len(numbers) < 7:
-                    numbers.append("0")
-
-                itc_integrated = float(numbers[3])
-                itc_central = float(numbers[4])
-                itc_state = float(numbers[5])
-                itc_cess = float(numbers[6])
-
-                itc_values = [
-                    itc_integrated,
-                    itc_central,
-                    itc_state,
-                    itc_cess,
-                ]
-
-                own_column_map = {
-                    "Integrated tax": 0,
-                    "Central tax": 1,
-                    "State/UT tax": 2,
-                    "Cess": 3,
-                }
-
-                own_index = own_column_map[tax_type]
-
-                # Cross Utilisation Rule
-                if itc_values[own_index] != 0:
-                    result[tax_type] = 0.0
-                else:
-                    cross_value = 0.0
-                    for idx, val in enumerate(itc_values):
-                        if idx != own_index and val != 0:
-                            cross_value = val
-                            break
-
-                    result[tax_type] = cross_value
-
-        # Ensure all tax types exist
-        for tax in ["Integrated tax", "Central tax", "State/UT tax", "Cess"]:
-            if tax not in result:
-                result[tax] = 0.0
-
-        return result
-
-
-# -------------------------------------------------
-# RUN
-# -------------------------------------------------
-if __name__ == "__main__":
-
-    pdf_file = r"pdf"
-
-    parser = GSTPaymentParser(pdf_file)
-
-    try:
-        output = parser.parse()
-        print("\nFinal Cross-Utilised ITC Values (Section A Only):")
-        print(output)
-    except Exception as e:
-        print("Error:", e)
+    return "\n".join(merged_lines)
