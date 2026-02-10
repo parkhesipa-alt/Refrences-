@@ -1,44 +1,73 @@
-def _normalize_text(self, text: str) -> str:
-    lines = [l.strip() for l in text.split("\n") if l.strip()]
-    merged_lines = []
-    i = 0
+def _extract_gstin(self) -> str:
+    with pdfplumber.open(self.pdf_path) as pdf:
+        first_page_text = pdf.pages[0].extract_text()
 
-    while i < len(lines):
-        current = lines[i]
+    match = re.search(r"\b\d{2}[A-Z]{5}\d{4}[A-Z]\d[A-Z]\w\b", first_page_text)
+    if not match:
+        raise ValueError("GSTIN not found on first page")
 
-        # Detect pattern:
-        # Central 25026059 ...
-        # tax 7.00 7.00 7.00
+    return match.group(0)
 
-        if (
-            i + 1 < len(lines)
-            and current.split()[0] in ["Integrated", "Central", "State/UT"]
-            and lines[i + 1].startswith("tax")
-        ):
-            first_parts = current.split()
-            second_parts = lines[i + 1].split()[1:]  # skip "tax"
 
-            merged = []
-            sec_index = 0
 
-            for part in first_parts:
-                if part.isdigit() and sec_index < len(second_parts):
-                    decimal = second_parts[sec_index]
-                    if re.fullmatch(r"\d+\.\d+", decimal):
-                        merged_number = part + decimal.replace(".", "")
-                        merged_number = merged_number[:-2] + "." + merged_number[-2:]
-                        merged.append(merged_number)
-                        sec_index += 1
-                    else:
-                        merged.append(part)
-                else:
-                    merged.append(part)
+gstin = self._extract_gstin()
 
-            merged_lines.append(" ".join(merged))
-            i += 2
-            continue
+result["GSTIN"] = gstin
 
-        merged_lines.append(current)
-        i += 1
+return {
+    "gstin": gstin,
+    "itc_values": result
+}
 
-    return "\n".join(merged_lines)
+
+
+
+
+
+import os
+
+def process_folder(folder_path):
+    results = []
+
+    for file in os.listdir(folder_path):
+        if file.lower().endswith(".pdf"):
+            pdf_path = os.path.join(folder_path, file)
+            print(f"Processing: {file}")
+
+            try:
+                parser = GSTPaymentParser(pdf_path)
+                data = parser.parse()
+                data["file_name"] = file
+                results.append(data)
+            except Exception as e:
+                print(f"Error in {file}: {e}")
+
+    return results
+
+
+
+
+
+
+if __name__ == "__main__":
+    folder = r"C:\Users\YourPath\GST NEFT"
+
+    all_results = process_folder(folder)
+
+    print("\nFinal Output:\n")
+
+    for record in all_results:
+        print("-" * 50)
+        for k, v in record.items():
+            if isinstance(v, Decimal):
+                print(f"{k}: {format(v, 'f')}")
+            else:
+                print(f"{k}: {v}")
+
+
+
+
+
+
+
+
