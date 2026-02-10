@@ -1,110 +1,166 @@
 import pdfplumber
+import re
 from typing import Dict
 
 
 class GSTPaymentParser:
 
-    TARGET_ROWS = ["Integrated tax", "Central tax", "State/UT tax", "Cess"]
+    TAX_STARTERS = ["Integrated", "Central", "State/UT", "Cess"]
 
     def __init__(self, pdf_path: str):
         self.pdf_path = pdf_path
 
-    def _find_section_a_table(self):
+    # -------------------------------------------------
+    # Extract Page 2
+    # -------------------------------------------------
+    def _extract_page_text(self) -> str:
         with pdfplumber.open(self.pdf_path) as pdf:
             if len(pdf.pages) < 2:
                 raise ValueError("PDF does not contain Page 2.")
+            return pdf.pages[1].extract_text()
 
-            page = pdf.pages[1]
+    # -------------------------------------------------
+    # Extract 6.1 Section
+    # -------------------------------------------------
+    def _extract_6_1_section(self, text: str) -> str:
+        match = re.search(r"6\.1\s+Payment of tax(.*?)(6\.2|$)", text, re.DOTALL)
+        if not match:
+            raise ValueError("6.1 section not found.")
+        return match.group(1)
 
-            # Extract all tables using line detection
-            tables = page.extract_tables()
+    # -------------------------------------------------
+    # Extract Section A
+    # -------------------------------------------------
+    def _extract_section_a(self, text: str) -> str:
+        match = re.search(r"\(A\)(.*?)(\(B\)|$)", text, re.DOTALL)
+        if not match:
+            raise ValueError("Section (A) not found.")
+        return match.group(1)
 
-            if not tables:
-                raise ValueError("No tables detected on page 2.")
+    # -------------------------------------------------
+    # Fix broken lines and broken digits
+    # -------------------------------------------------
+    def _fix_broken_lines(self, text: str) -> str:
+        lines = [line.strip() for line in text.split("\n") if line.strip()]
+        merged = []
+        i = 0
 
-            # Find table containing Section A
-            for table in tables:
-                for row in table:
-                    if row and any("Other than reverse charge" in str(cell) for cell in row if cell):
-                        return table
+        while i < len(lines):
+            current = lines[i]
 
-            raise ValueError("Section (A) table not found.")
+            # 1️⃣ Merge if next line starts with "tax"
+            if (
+                i + 1 < len(lines)
+                and lines[i + 1].lower().startswith("tax")
+                and any(current.startswith(t) for t in self.TAX_STARTERS)
+            ):
+                current = current + " " + lines[i + 1]
+                i += 2
+                merged.append(current)
+                continue
 
+            # 2️⃣ Merge split digits like:
+            # 25026059
+            # 7.00
+            if i + 1 < len(lines):
+                next_line = lines[i + 1]
+
+                digit_end = re.search(r"(\d+)$", current)
+                decimal_line = re.match(r"^(\d+\.\d+)$", next_line)
+
+                if digit_end and decimal_line:
+                    combined = digit_end.group(1) + decimal_line.group(1)
+                    current = re.sub(r"(\d+)$", combined, current)
+                    i += 2
+                    merged.append(current)
+                    continue
+
+            merged.append(current)
+            i += 1
+
+        return "\n".join(merged)
+
+    # -------------------------------------------------
+    # MAIN PARSER
+    # -------------------------------------------------
     def parse(self) -> Dict[str, float]:
 
-        table = self._find_section_a_table()
+        page_text = self._extract_page_text()
+        section_6_1 = self._extract_6_1_section(page_text)
+        section_a = self._extract_section_a(section_6_1)
+
+        # Fix PDF broken layout
+        section_a = self._fix_broken_lines(section_a)
+
+        lines = [line.strip() for line in section_a.split("\n") if line.strip()]
 
         result = {}
-        in_section_a = False
 
-        for row in table:
-            if not row:
-                continue
+        for line in lines:
+            words = line.split()
 
-            first_cell = str(row[0]).strip() if row[0] else ""
+            if words and words[0] in self.TAX_STARTERS:
 
-            if "Other than reverse charge" in first_cell:
-                in_section_a = True
-                continue
+                tax_type = words[0]
+                if tax_type != "Cess":
+                    tax_type += " tax"
 
-            if "Reverse charge" in first_cell:
-                break
+                # Extract numbers (supports commas)
+                numbers = re.findall(r"\d[\d,]*\.\d+|\d[\d,]*", line)
 
-            if not in_section_a:
-                continue
+                # Remove commas before converting
+                numbers = [n.replace(",", "") for n in numbers]
 
-            if first_cell in self.TARGET_ROWS:
+                while len(numbers) < 7:
+                    numbers.append("0")
 
-                cleaned = []
-                for cell in row:
-                    if cell is None or cell.strip() in ["", "-"]:
-                        cleaned.append("0")
-                    else:
-                        cleaned.append(cell.replace(",", "").strip())
-
-                try:
-                    itc_integrated = float(cleaned[4])
-                    itc_central = float(cleaned[5])
-                    itc_state = float(cleaned[6])
-                    itc_cess = float(cleaned[7])
-                except (IndexError, ValueError):
-                    itc_integrated = itc_central = itc_state = itc_cess = 0.0
+                itc_integrated = float(numbers[3])
+                itc_central = float(numbers[4])
+                itc_state = float(numbers[5])
+                itc_cess = float(numbers[6])
 
                 itc_values = [
                     itc_integrated,
                     itc_central,
                     itc_state,
-                    itc_cess
+                    itc_cess,
                 ]
 
-                own_index = {
+                own_column_map = {
                     "Integrated tax": 0,
                     "Central tax": 1,
                     "State/UT tax": 2,
-                    "Cess": 3
-                }[first_cell]
+                    "Cess": 3,
+                }
 
-                # Cross-utilisation logic
+                own_index = own_column_map[tax_type]
+
+                # Cross Utilisation Rule
                 if itc_values[own_index] != 0:
-                    result[first_cell] = 0.0
+                    result[tax_type] = 0.0
                 else:
                     cross_value = 0.0
                     for idx, val in enumerate(itc_values):
                         if idx != own_index and val != 0:
                             cross_value = val
                             break
-                    result[first_cell] = cross_value
 
-        for tax in self.TARGET_ROWS:
+                    result[tax_type] = cross_value
+
+        # Ensure all tax types exist
+        for tax in ["Integrated tax", "Central tax", "State/UT tax", "Cess"]:
             if tax not in result:
                 result[tax] = 0.0
 
         return result
 
 
-# ---------------- RUN ----------------
+# -------------------------------------------------
+# RUN
+# -------------------------------------------------
 if __name__ == "__main__":
-    pdf_file = r"yourfile.pdf"
+
+    pdf_file = r"pdf"
 
     parser = GSTPaymentParser(pdf_file)
 
