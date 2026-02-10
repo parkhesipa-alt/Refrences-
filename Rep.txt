@@ -9,63 +9,44 @@ class GSTPaymentParser:
     def __init__(self, pdf_path: str):
         self.pdf_path = pdf_path
 
-    # ---------------------------------------------------
-    # Extract Section A table using coordinates
-    # ---------------------------------------------------
-    def _extract_section_a_table(self):
-
+    def _find_section_a_table(self):
         with pdfplumber.open(self.pdf_path) as pdf:
             if len(pdf.pages) < 2:
                 raise ValueError("PDF does not contain Page 2.")
 
             page = pdf.pages[1]
 
-            # Find "6.1 Payment of tax"
-            words = page.extract_words()
-
-            y_start = None
-            for w in words:
-                if "6.1" in w["text"]:
-                    y_start = w["top"]
-                    break
-
-            if y_start is None:
-                raise ValueError("6.1 section not found.")
-
-            # Crop area below 6.1 heading (adjust if needed)
-            cropped = page.crop((0, y_start + 20, page.width, page.height))
-
-            tables = cropped.extract_tables()
+            # Extract all tables using line detection
+            tables = page.extract_tables()
 
             if not tables:
-                raise ValueError("No tables detected.")
+                raise ValueError("No tables detected on page 2.")
 
-            return tables[0]  # first detected table
+            # Find table containing Section A
+            for table in tables:
+                for row in table:
+                    if row and any("Other than reverse charge" in str(cell) for cell in row if cell):
+                        return table
 
-    # ---------------------------------------------------
-    # Parse Section A only
-    # ---------------------------------------------------
+            raise ValueError("Section (A) table not found.")
+
     def parse(self) -> Dict[str, float]:
 
-        table = self._extract_section_a_table()
+        table = self._find_section_a_table()
 
         result = {}
-
         in_section_a = False
 
         for row in table:
-
             if not row:
                 continue
 
             first_cell = str(row[0]).strip() if row[0] else ""
 
-            # Detect Section A start
             if "Other than reverse charge" in first_cell:
                 in_section_a = True
                 continue
 
-            # Detect Section B start
             if "Reverse charge" in first_cell:
                 break
 
@@ -74,29 +55,18 @@ class GSTPaymentParser:
 
             if first_cell in self.TARGET_ROWS:
 
-                # Clean numeric cells
-                cleaned_row = []
+                cleaned = []
                 for cell in row:
-                    if cell is None or cell == "-" or cell == "":
-                        cleaned_row.append("0")
+                    if cell is None or cell.strip() in ["", "-"]:
+                        cleaned.append("0")
                     else:
-                        cleaned_row.append(cell.replace(",", "").strip())
-
-                # Based on visual table layout:
-                # 0 = Description
-                # 1 = Tax payable
-                # 2 = Adjustment
-                # 3 = Net tax payable
-                # 4 = ITC Integrated
-                # 5 = ITC Central
-                # 6 = ITC State/UT
-                # 7 = ITC Cess
+                        cleaned.append(cell.replace(",", "").strip())
 
                 try:
-                    itc_integrated = float(cleaned_row[4])
-                    itc_central = float(cleaned_row[5])
-                    itc_state = float(cleaned_row[6])
-                    itc_cess = float(cleaned_row[7])
+                    itc_integrated = float(cleaned[4])
+                    itc_central = float(cleaned[5])
+                    itc_state = float(cleaned[6])
+                    itc_cess = float(cleaned[7])
                 except (IndexError, ValueError):
                     itc_integrated = itc_central = itc_state = itc_cess = 0.0
 
@@ -107,20 +77,14 @@ class GSTPaymentParser:
                     itc_cess
                 ]
 
-                own_column_map = {
+                own_index = {
                     "Integrated tax": 0,
                     "Central tax": 1,
                     "State/UT tax": 2,
                     "Cess": 3
-                }
+                }[first_cell]
 
-                own_index = own_column_map[first_cell]
-
-                # -------------------------
-                # CROSS-UTILISATION RULE
-                # -------------------------
-
-                # Ignore if value is in own column
+                # Cross-utilisation logic
                 if itc_values[own_index] != 0:
                     result[first_cell] = 0.0
                 else:
@@ -131,7 +95,6 @@ class GSTPaymentParser:
                             break
                     result[first_cell] = cross_value
 
-        # Ensure all rows appear
         for tax in self.TARGET_ROWS:
             if tax not in result:
                 result[tax] = 0.0
@@ -139,11 +102,8 @@ class GSTPaymentParser:
         return result
 
 
-# ---------------------------------------------------
-# RUN
-# ---------------------------------------------------
+# ---------------- RUN ----------------
 if __name__ == "__main__":
-
     pdf_file = r"yourfile.pdf"
 
     parser = GSTPaymentParser(pdf_file)
