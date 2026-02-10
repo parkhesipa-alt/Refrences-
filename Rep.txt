@@ -1,43 +1,42 @@
 def _normalize_text(self, text: str) -> str:
-    lines = text.split("\n")
+    lines = [l.strip() for l in text.split("\n") if l.strip()]
     merged_lines = []
     i = 0
 
     while i < len(lines):
-        current = lines[i].strip()
+        current = lines[i]
 
-        # --------------------------------------------------
-        # FIX 1: Merge broken tax labels
-        # Example:
-        # Central
-        # tax
-        # --------------------------------------------------
+        # Detect pattern:
+        # Central 25026059 ...
+        # tax 7.00 7.00 7.00
+
         if (
             i + 1 < len(lines)
-            and current in ["Integrated", "Central", "State/UT"]
-            and lines[i + 1].strip() == "tax"
+            and current.split()[0] in ["Integrated", "Central", "State/UT"]
+            and lines[i + 1].startswith("tax")
         ):
-            merged_lines.append(current + " tax")
+            first_parts = current.split()
+            second_parts = lines[i + 1].split()[1:]  # skip "tax"
+
+            merged = []
+            sec_index = 0
+
+            for part in first_parts:
+                if part.isdigit() and sec_index < len(second_parts):
+                    decimal = second_parts[sec_index]
+                    if re.fullmatch(r"\d+\.\d+", decimal):
+                        merged_number = part + decimal.replace(".", "")
+                        merged_number = merged_number[:-2] + "." + merged_number[-2:]
+                        merged.append(merged_number)
+                        sec_index += 1
+                    else:
+                        merged.append(part)
+                else:
+                    merged.append(part)
+
+            merged_lines.append(" ".join(merged))
             i += 2
             continue
-
-        # --------------------------------------------------
-        # FIX 2: Merge split numbers like:
-        # 25026059
-        # 7.00
-        # --------------------------------------------------
-        if i + 1 < len(lines):
-            next_line = lines[i + 1].strip()
-
-            whole_match = re.fullmatch(r"\d+", current)
-            decimal_match = re.fullmatch(r"\d+\.\d+", next_line)
-
-            if whole_match and decimal_match:
-                merged_number = current + decimal_match.group().replace(".", "")
-                merged_number = merged_number[:-2] + "." + merged_number[-2:]
-                merged_lines.append(merged_number)
-                i += 2
-                continue
 
         merged_lines.append(current)
         i += 1
