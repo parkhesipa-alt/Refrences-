@@ -1,58 +1,53 @@
-def _normalize_text(self, text: str) -> str:
-    lines = [l.strip() for l in text.split("\n") if l.strip()]
-    merged_lines = []
-    i = 0
+from pydantic import BaseModel, validator, Field
+from typing import List
+import re
 
-    while i < len(lines):
-        current = lines[i]
+PAN_REGEX = r'^[A-Z]{5}\d{4}[A-Z]{1}$'
 
-        # Detect row split:
-        # Central ....
-        # tax 7.00 7.00 7.00
 
-        if (
-            i + 1 < len(lines)
-            and current.split()[0] in ["Integrated", "Central", "State/UT"]
-            and lines[i + 1].startswith("tax")
-        ):
-            first_parts = current.split()
-            second_parts = lines[i + 1].split()[1:]
+class BulkPANRequest(BaseModel):
+    username: str = Field(..., min_length=3, max_length=50)
+    password: str = Field(..., min_length=3)
+    panList: List[str] = Field(..., min_items=1, max_items=50)
 
-            merged = []
-            sec_index = 0
+    @validator("panList", each_item=True)
+    def validate_pan(cls, v: str):
+        if not re.match(PAN_REGEX, v):
+            raise ValueError(f"Invalid PAN format: {v}")
+        return v.upper()
 
-            for part in first_parts:
 
-                if part.isdigit() and sec_index < len(second_parts):
 
-                    decimal = second_parts[sec_index]
 
-                    # Case 1: full decimal like 7.00 or 123.456
-                    if re.fullmatch(r"\d+\.\d+", decimal):
-                        merged.append(part + decimal)
-                        sec_index += 1
+@router.post("/bulk_pan")
+async def bulk_pan_verification(req: BulkPANRequest):
 
-                    # Case 2: decimal starting with dot like .700
-                    elif re.fullmatch(r"\.\d+", decimal):
-                        merged.append(part + decimal)
-                        sec_index += 1
+    # -------- AUTH VALIDATION --------
+    project_id = os.getenv("GCP_PROJECT_ID")
+    if not project_id:
+        raise HTTPException(status_code=500, detail="Project ID not configured")
 
-                    # Case 3: number ending with dot like 6140352. + 00
-                    elif part.endswith(".") and re.fullmatch(r"\d+", decimal):
-                        merged.append(part + decimal)
-                        sec_index += 1
+    try:
+        secret_name = f"USER_{req.username}"
+        stored_password = get_secret_from_gcp(secret_name, project_id)
+    except Exception:
+        raise HTTPException(status_code=401, detail="Invalid credentials")
 
-                    else:
-                        merged.append(part)
+    if req.password != stored_password:
+        raise HTTPException(status_code=401, detail="Invalid credentials")
 
-                else:
-                    merged.append(part)
+    # -------- EXISTING LOGIC --------
+    if not req.panList:
+        raise HTTPException(status_code=400, detail="panList cannot be empty")
 
-            merged_lines.append(" ".join(merged))
-            i += 2
-            continue
+    if len(req.panList) > 50:
+        raise HTTPException(status_code=400, detail="Max 50 PANs allowed per request")
 
-        merged_lines.append(current)
-        i += 1
+    tasks = [process_single_pan(pan) for pan in req.panList]
+    results = await asyncio.gather(*tasks)
 
-    return "\n".join(merged_lines)
+    return {
+        "total": len(results),
+        "results": results
+    }
+
