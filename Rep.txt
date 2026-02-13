@@ -1,53 +1,72 @@
-from pydantic import BaseModel, validator, Field
-from typing import List
-import re
+def parse(self):
 
-PAN_REGEX = r'^[A-Z]{5}\d{4}[A-Z]{1}$'
+    gstin = self._extract_gstin()
 
+    page_text = self._extract_page_text()
+    section_6_1 = self._extract_6_1_section(page_text)
+    section_a = self._extract_section_a(section_6_1)
 
-class BulkPANRequest(BaseModel):
-    username: str = Field(..., min_length=3, max_length=50)
-    password: str = Field(..., min_length=3)
-    panList: List[str] = Field(..., min_items=1, max_items=50)
+    section_a = self._normalize_text(section_a)
 
-    @validator("panList", each_item=True)
-    def validate_pan(cls, v: str):
-        if not re.match(PAN_REGEX, v):
-            raise ValueError(f"Invalid PAN format: {v}")
-        return v.upper()
+    lines = [line.strip() for line in section_a.split("\n") if line.strip()]
 
+    journal_entries = []
 
+    for line in lines:
+        words = line.split()
 
+        if words and words[0] in self.TAX_STARTERS:
 
-@router.post("/bulk_pan")
-async def bulk_pan_verification(req: BulkPANRequest):
+            tax_type = words[0]
+            if tax_type != "Cess":
+                tax_type += " tax"
 
-    # -------- AUTH VALIDATION --------
-    project_id = os.getenv("GCP_PROJECT_ID")
-    if not project_id:
-        raise HTTPException(status_code=500, detail="Project ID not configured")
+            numbers = re.findall(r"\d+\.\d+|\d+|-", line)
+            numbers = [Decimal("0") if n == "-" else Decimal(n) for n in numbers]
 
-    try:
-        secret_name = f"USER_{req.username}"
-        stored_password = get_secret_from_gcp(secret_name, project_id)
-    except Exception:
-        raise HTTPException(status_code=401, detail="Invalid credentials")
+            while len(numbers) < 7:
+                numbers.append(Decimal("0"))
 
-    if req.password != stored_password:
-        raise HTTPException(status_code=401, detail="Invalid credentials")
+            # ITC Columns
+            itc_values = [
+                numbers[3],  # Integrated
+                numbers[4],  # Central
+                numbers[5],  # State/UT
+                numbers[6],  # Cess
+            ]
 
-    # -------- EXISTING LOGIC --------
-    if not req.panList:
-        raise HTTPException(status_code=400, detail="panList cannot be empty")
+            own_column_map = {
+                "Integrated tax": 0,
+                "Central tax": 1,
+                "State/UT tax": 2,
+                "Cess": 3
+            }
 
-    if len(req.panList) > 50:
-        raise HTTPException(status_code=400, detail="Max 50 PANs allowed per request")
+            own_index = own_column_map[tax_type]
 
-    tasks = [process_single_pan(pan) for pan in req.panList]
-    results = await asyncio.gather(*tasks)
+            # Mapping for journal
+            account_map = {
+                0: "IGST",
+                1: "CGST",
+                2: "SGST",
+                3: "CESS"
+            }
+
+            debit_account = account_map[own_index]
+
+            # Check cross utilisation
+            for idx, val in enumerate(itc_values):
+                if idx != own_index and val != Decimal("0"):
+
+                    credit_account = account_map[idx]
+
+                    journal_entries.append({
+                        "Debit": debit_account,
+                        "Credit": credit_account,
+                        "Amount": val
+                    })
 
     return {
-        "total": len(results),
-        "results": results
+        "GSTIN": gstin,
+        "Entries": journal_entries
     }
-
